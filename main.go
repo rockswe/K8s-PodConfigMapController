@@ -108,3 +108,24 @@ func deleteConfigMapForPod(clientset *kubernetes.Clientset, pod *corev1.Pod) {
         log.Printf("ConfigMap deleted for Pod %s\n", pod.Name)
     }
 }
+
+podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+    AddFunc: func(obj interface{}) {
+        pod := obj.(*corev1.Pod)
+        log.Printf("Pod Created: %s/%s\n", pod.Namespace, pod.Name)
+        createConfigMapForPod(clientset, pod)
+    },
+    UpdateFunc: func(oldObj, newObj interface{}) {
+        oldPod := oldObj.(*corev1.Pod)
+        newPod := newObj.(*corev1.Pod)
+        
+        if oldPod.Status.Phase != newPod.Status.Phase {
+            log.Printf("Pod Updated: %s/%s. Status: %s -> %s\n", newPod.Namespace, newPod.Name, oldPod.Status.Phase, newPod.Status.Phase)
+        }
+    },
+    DeleteFunc: func(obj interface{}) {
+        pod := obj.(*corev1.Pod)
+        log.Printf("Pod Deleted: %s/%s\n", pod.Namespace, pod.Name)
+        deleteConfigMapForPod(clientset, pod)
+    },
+})
