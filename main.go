@@ -129,3 +129,23 @@ podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
         deleteConfigMapForPod(clientset, pod)
     },
 })
+
+// Assuming MyResource CRD informer is set up
+myResourceInformer := informerFactory.ForResource(schema.GroupVersionResource{
+    Group:    "mydomain.com",
+    Version:  "v1",
+    Resource: "myresources",
+}).Informer()
+
+myResourceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+    AddFunc: func(obj interface{}) {
+        // Handle creation of MyResource objects
+        // You can modify the behavior of the controller based on the resource spec
+    },
+    UpdateFunc: func(oldObj, newObj interface{}) {
+        // Handle updates to MyResource objects
+    },
+    DeleteFunc: func(obj interface{}) {
+        // Handle deletion of MyResource objects
+    },
+})
