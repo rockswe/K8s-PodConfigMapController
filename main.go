@@ -5,17 +5,41 @@ import (
     "flag"
     "fmt"
     "log"
+    "net/http"
+    "os"
     "path/filepath"
     "time"
 
+    corev1 "k8s.io/api/core/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/runtime/schema"
     "k8s.io/client-go/informers"
     "k8s.io/client-go/kubernetes"
     "k8s.io/client-go/tools/cache"
     "k8s.io/client-go/tools/clientcmd"
+    "k8s.io/client-go/tools/leaderelection"
+    "k8s.io/client-go/tools/leaderelection/resourcelock"
     "k8s.io/client-go/util/homedir"
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    corev1 "k8s.io/api/core/v1"
+
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var (
+    podsCreated = prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "pods_created_total",
+        Help: "Total number of pods created.",
+    })
+    podsDeleted = prometheus.NewCounter(prometheus.CounterOpts{
+        Name: "pods_deleted_total",
+        Help: "Total number of pods deleted.",
+    })
+)
+
+func init() {
+    prometheus.MustRegister(podsCreated)
+    prometheus.MustRegister(podsDeleted)
+}
 
 func main() {
     var kubeconfig string
@@ -38,8 +62,56 @@ func main() {
         log.Fatalf("Error creating Kubernetes client: %v", err)
     }
 
-    // Create an informer factory for the default namespace
-    informerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Second*30, informers.WithNamespace("default"))
+    // Set up leader election
+    id, err := os.Hostname()
+    if err != nil {
+        log.Fatalf("Failed to get hostname: %v", err)
+    }
+
+    lock := &resourcelock.LeaseLock{
+        LeaseMeta: metav1.ObjectMeta{
+            Name:      "my-controller-leader-election",
+            Namespace: "default",
+        },
+        Client: clientset.CoordinationV1(),
+        LockConfig: resourcelock.ResourceLockConfig{
+            Identity: id,
+        },
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    go func() {
+        http.Handle("/metrics", promhttp.Handler())
+        log.Println("Starting Prometheus metrics server on :8080")
+        if err := http.ListenAndServe(":8080", nil); err != nil {
+            log.Fatalf("Failed to start metrics server: %v", err)
+        }
+    }()
+
+    leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+        Lock:          lock,
+        LeaseDuration: 15 * time.Second,
+        RenewDeadline: 10 * time.Second,
+        RetryPeriod:   2 * time.Second,
+        Callbacks: leaderelection.LeaderCallbacks{
+            OnStartedLeading: func(ctx context.Context) {
+                runController(ctx, clientset)
+            },
+            OnStoppedLeading: func() {
+                log.Printf("Leader lost: %s", id)
+                os.Exit(0)
+            },
+        },
+        ReleaseOnCancel: true,
+        Name:            "my-controller",
+    })
+}
+
+func runController(ctx context.Context, clientset *kubernetes.Clientset) {
+    // Create an informer factory for all namespaces
+    informerFactory := informers.NewSharedInformerFactory(clientset, time.Second*30)
 
     // Get pod informer
     podInformer := informerFactory.Core().V1().Pods().Informer()
@@ -52,6 +124,15 @@ func main() {
 
             // Create a ConfigMap for the pod
             createConfigMapForPod(clientset, pod)
+            podsCreated.Inc()
+        },
+        UpdateFunc: func(oldObj, newObj interface{}) {
+            oldPod := oldObj.(*corev1.Pod)
+            newPod := newObj.(*corev1.Pod)
+
+            if oldPod.Status.Phase != newPod.Status.Phase {
+                log.Printf("Pod Updated: %s/%s. Status: %s -> %s\n", newPod.Namespace, newPod.Name, oldPod.Status.Phase, newPod.Status.Phase)
+            }
         },
         DeleteFunc: func(obj interface{}) {
             pod := obj.(*corev1.Pod)
@@ -59,22 +140,22 @@ func main() {
 
             // Delete the ConfigMap associated with the pod
             deleteConfigMapForPod(clientset, pod)
+            podsDeleted.Inc()
         },
     })
 
-    stopCh := make(chan struct{})
-    defer close(stopCh)
-
     // Start the informer to watch for Pod changes
-    informerFactory.Start(stopCh)
+    informerFactory.Start(ctx.Done())
 
     // Wait for the cache to synchronize
-    if !cache.WaitForCacheSync(stopCh, podInformer.HasSynced) {
+    if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced) {
         log.Fatalf("Error syncing cache")
     }
 
-    // Block the main thread
-    <-stopCh
+    log.Println("Controller has started, waiting for events...")
+
+    // Block until the context is canceled
+    <-ctx.Done()
 }
 
 // Create a ConfigMap for the pod
@@ -92,9 +173,9 @@ func createConfigMapForPod(clientset *kubernetes.Clientset, pod *corev1.Pod) {
 
     _, err := clientset.CoreV1().ConfigMaps(pod.Namespace).Create(context.TODO(), configMap, metav1.CreateOptions{})
     if err != nil {
-        log.Printf("Error creating ConfigMap for Pod %s: %v\n", pod.Name, err)
+        log.Printf("Error creating ConfigMap for Pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
     } else {
-        log.Printf("ConfigMap created for Pod %s\n", pod.Name)
+        log.Printf("ConfigMap created for Pod %s/%s\n", pod.Namespace, pod.Name)
     }
 }
 
@@ -103,49 +184,8 @@ func deleteConfigMapForPod(clientset *kubernetes.Clientset, pod *corev1.Pod) {
     configMapName := fmt.Sprintf("configmap-%s", pod.Name)
     err := clientset.CoreV1().ConfigMaps(pod.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
     if err != nil {
-        log.Printf("Error deleting ConfigMap for Pod %s: %v\n", pod.Name, err)
+        log.Printf("Error deleting ConfigMap for Pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
     } else {
-        log.Printf("ConfigMap deleted for Pod %s\n", pod.Name)
+        log.Printf("ConfigMap deleted for Pod %s/%s\n", pod.Namespace, pod.Name)
     }
 }
-
-podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-    AddFunc: func(obj interface{}) {
-        pod := obj.(*corev1.Pod)
-        log.Printf("Pod Created: %s/%s\n", pod.Namespace, pod.Name)
-        createConfigMapForPod(clientset, pod)
-    },
-    UpdateFunc: func(oldObj, newObj interface{}) {
-        oldPod := oldObj.(*corev1.Pod)
-        newPod := newObj.(*corev1.Pod)
-        
-        if oldPod.Status.Phase != newPod.Status.Phase {
-            log.Printf("Pod Updated: %s/%s. Status: %s -> %s\n", newPod.Namespace, newPod.Name, oldPod.Status.Phase, newPod.Status.Phase)
-        }
-    },
-    DeleteFunc: func(obj interface{}) {
-        pod := obj.(*corev1.Pod)
-        log.Printf("Pod Deleted: %s/%s\n", pod.Namespace, pod.Name)
-        deleteConfigMapForPod(clientset, pod)
-    },
-})
-
-// Assuming MyResource CRD informer is set up
-myResourceInformer := informerFactory.ForResource(schema.GroupVersionResource{
-    Group:    "mydomain.com",
-    Version:  "v1",
-    Resource: "myresources",
-}).Informer()
-
-myResourceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-    AddFunc: func(obj interface{}) {
-        // Handle creation of MyResource objects
-        // You can modify the behavior of the controller based on the resource spec
-    },
-    UpdateFunc: func(oldObj, newObj interface{}) {
-        // Handle updates to MyResource objects
-    },
-    DeleteFunc: func(obj interface{}) {
-        // Handle deletion of MyResource objects
-    },
-})
