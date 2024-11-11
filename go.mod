@@ -1,12 +1,11 @@
-module customk8scontroller
+module github.com/rockswe/K8s-PodConfigMapController
 
-go 1.19
+go 1.20
 
 require (
-    github.com/prometheus/client_golang v1.14.0
+    github.com/go-logr/logr v1.2.3
     k8s.io/api v0.28.1
     k8s.io/apimachinery v0.28.1
     k8s.io/client-go v0.28.1
-    k8s.io/code-generator v0.28.1
-    k8s.io/klog/v2 v2.60.1
+    sigs.k8s.io/controller-runtime v0.15.0
 )
