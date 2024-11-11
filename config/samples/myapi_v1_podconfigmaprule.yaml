@@ -1,0 +1,9 @@
+apiVersion: idontknowjustanexample.com/v1
+kind: PodConfigMapRule
+metadata:
+  name: sample-podconfigmaprule
+spec:
+  selector:
+    matchLabels:
+      environment: production
+  configMapNameTemplate: "{{.PodName}}-configmap"
