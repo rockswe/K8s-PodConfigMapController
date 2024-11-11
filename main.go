@@ -1,191 +1,82 @@
 package main
 
 import (
-    "context"
     "flag"
-    "fmt"
-    "log"
-    "net/http"
     "os"
-    "path/filepath"
-    "time"
 
     corev1 "k8s.io/api/core/v1"
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "k8s.io/apimachinery/pkg/runtime/schema"
-    "k8s.io/client-go/informers"
-    "k8s.io/client-go/kubernetes"
-    "k8s.io/client-go/tools/cache"
-    "k8s.io/client-go/tools/clientcmd"
-    "k8s.io/client-go/tools/leaderelection"
+    clientgoscheme "k8s.io/client-go/kubernetes/scheme"
     "k8s.io/client-go/tools/leaderelection/resourcelock"
-    "k8s.io/client-go/util/homedir"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/healthz"
+    "sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-    "github.com/prometheus/client_golang/prometheus"
-    "github.com/prometheus/client_golang/prometheus/promhttp"
+    myapiv1 "github.com/yourrepo/yourcontroller/api/v1"
+    "github.com/yourrepo/yourcontroller/controllers"
+    "k8s.io/apimachinery/pkg/runtime"
+    utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 )
 
 var (
-    podsCreated = prometheus.NewCounter(prometheus.CounterOpts{
-        Name: "pods_created_total",
-        Help: "Total number of pods created.",
-    })
-    podsDeleted = prometheus.NewCounter(prometheus.CounterOpts{
-        Name: "pods_deleted_total",
-        Help: "Total number of pods deleted.",
-    })
+    scheme   = runtime.NewScheme()
+    setupLog = ctrl.Log.WithName("setup")
 )
 
 func init() {
-    prometheus.MustRegister(podsCreated)
-    prometheus.MustRegister(podsDeleted)
+    utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+    utilruntime.Must(myapiv1.AddToScheme(scheme))
 }
 
 func main() {
-    var kubeconfig string
-    if home := homedir.HomeDir(); home != "" {
-        kubeconfig = filepath.Join(home, ".kube", "config")
-    } else {
-        kubeconfig = ""
-    }
+    var metricsAddr string
+    var enableLeaderElection bool
+    var probeAddr string
+    flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+    flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+    flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 
-    flag.StringVar(&kubeconfig, "kubeconfig", kubeconfig, "(optional) absolute path to the kubeconfig file")
+    opts := zap.Options{
+        Development: true,
+    }
+    opts.BindFlags(flag.CommandLine)
     flag.Parse()
 
-    config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-    if err != nil {
-        log.Fatalf("Error building kubeconfig: %v", err)
-    }
+    ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-    clientset, err := kubernetes.NewForConfig(config)
-    if err != nil {
-        log.Fatalf("Error creating Kubernetes client: %v", err)
-    }
-
-    // Set up leader election
-    id, err := os.Hostname()
-    if err != nil {
-        log.Fatalf("Failed to get hostname: %v", err)
-    }
-
-    lock := &resourcelock.LeaseLock{
-        LeaseMeta: metav1.ObjectMeta{
-            Name:      "my-controller-leader-election",
-            Namespace: "default",
-        },
-        Client: clientset.CoordinationV1(),
-        LockConfig: resourcelock.ResourceLockConfig{
-            Identity: id,
-        },
-    }
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    go func() {
-        http.Handle("/metrics", promhttp.Handler())
-        log.Println("Starting Prometheus metrics server on :8080")
-        if err := http.ListenAndServe(":8080", nil); err != nil {
-            log.Fatalf("Failed to start metrics server: %v", err)
-        }
-    }()
-
-    leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-        Lock:          lock,
-        LeaseDuration: 15 * time.Second,
-        RenewDeadline: 10 * time.Second,
-        RetryPeriod:   2 * time.Second,
-        Callbacks: leaderelection.LeaderCallbacks{
-            OnStartedLeading: func(ctx context.Context) {
-                runController(ctx, clientset)
-            },
-            OnStoppedLeading: func() {
-                log.Printf("Leader lost: %s", id)
-                os.Exit(0)
-            },
-        },
-        ReleaseOnCancel: true,
-        Name:            "my-controller",
+    mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+        Scheme:                     scheme,
+        MetricsBindAddress:         metricsAddr,
+        Port:                       9443,
+        HealthProbeBindAddress:     probeAddr,
+        LeaderElection:             enableLeaderElection,
+        LeaderElectionID:           "podconfigmapcontroller-leader-election",
+        LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
     })
-}
-
-func runController(ctx context.Context, clientset *kubernetes.Clientset) {
-    // Create an informer factory for all namespaces
-    informerFactory := informers.NewSharedInformerFactory(clientset, time.Second*30)
-
-    // Get pod informer
-    podInformer := informerFactory.Core().V1().Pods().Informer()
-
-    // Add event handlers to handle pod create, update, and delete events
-    podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-        AddFunc: func(obj interface{}) {
-            pod := obj.(*corev1.Pod)
-            log.Printf("Pod Created: %s/%s\n", pod.Namespace, pod.Name)
-
-            // Create a ConfigMap for the pod
-            createConfigMapForPod(clientset, pod)
-            podsCreated.Inc()
-        },
-        UpdateFunc: func(oldObj, newObj interface{}) {
-            oldPod := oldObj.(*corev1.Pod)
-            newPod := newObj.(*corev1.Pod)
-
-            if oldPod.Status.Phase != newPod.Status.Phase {
-                log.Printf("Pod Updated: %s/%s. Status: %s -> %s\n", newPod.Namespace, newPod.Name, oldPod.Status.Phase, newPod.Status.Phase)
-            }
-        },
-        DeleteFunc: func(obj interface{}) {
-            pod := obj.(*corev1.Pod)
-            log.Printf("Pod Deleted: %s/%s\n", pod.Namespace, pod.Name)
-
-            // Delete the ConfigMap associated with the pod
-            deleteConfigMapForPod(clientset, pod)
-            podsDeleted.Inc()
-        },
-    })
-
-    // Start the informer to watch for Pod changes
-    informerFactory.Start(ctx.Done())
-
-    // Wait for the cache to synchronize
-    if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced) {
-        log.Fatalf("Error syncing cache")
-    }
-
-    log.Println("Controller has started, waiting for events...")
-
-    // Block until the context is canceled
-    <-ctx.Done()
-}
-
-// Create a ConfigMap for the pod
-func createConfigMapForPod(clientset *kubernetes.Clientset, pod *corev1.Pod) {
-    configMap := &corev1.ConfigMap{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      fmt.Sprintf("configmap-%s", pod.Name),
-            Namespace: pod.Namespace,
-        },
-        Data: map[string]string{
-            "podName": pod.Name,
-            "podIP":   pod.Status.PodIP,
-        },
-    }
-
-    _, err := clientset.CoreV1().ConfigMaps(pod.Namespace).Create(context.TODO(), configMap, metav1.CreateOptions{})
     if err != nil {
-        log.Printf("Error creating ConfigMap for Pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
-    } else {
-        log.Printf("ConfigMap created for Pod %s/%s\n", pod.Namespace, pod.Name)
+        setupLog.Error(err, "unable to start manager")
+        os.Exit(1)
     }
-}
 
-// Delete the ConfigMap associated with the pod
-func deleteConfigMapForPod(clientset *kubernetes.Clientset, pod *corev1.Pod) {
-    configMapName := fmt.Sprintf("configmap-%s", pod.Name)
-    err := clientset.CoreV1().ConfigMaps(pod.Namespace).Delete(context.TODO(), configMapName, metav1.DeleteOptions{})
-    if err != nil {
-        log.Printf("Error deleting ConfigMap for Pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
-    } else {
-        log.Printf("ConfigMap deleted for Pod %s/%s\n", pod.Namespace, pod.Name)
+    if err = (&controllers.PodConfigMapReconciler{
+        Client: mgr.GetClient(),
+        Scheme: mgr.GetScheme(),
+    }).SetupWithManager(mgr); err != nil {
+        setupLog.Error(err, "unable to create controller", "controller", "PodConfigMap")
+        os.Exit(1)
+    }
+
+    if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+        setupLog.Error(err, "unable to set up health check")
+        os.Exit(1)
+    }
+    if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+        setupLog.Error(err, "unable to set up ready check")
+        os.Exit(1)
+    }
+
+    setupLog.Info("starting manager")
+    if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+        setupLog.Error(err, "problem running manager")
+        os.Exit(1)
     }
 }
