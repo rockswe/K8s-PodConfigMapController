@@ -1,4 +1,4 @@
-# PodConfigMapController (CURRENTLY NOT WORKING - IN MAINTENANCE)
+# PodConfigMapController (NOT WORKING - IN MAINTENANCE)
 
 A custom Kubernetes controller written in Go that watches for Pod events and automatically creates or deletes ConfigMaps containing their metadata. The controller supports:
 
