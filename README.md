@@ -223,14 +223,6 @@ Developing robust Kubernetes controllers requires careful consideration of API d
 ### Workqueue/Resync Mechanics
 
 *   The controller uses separate workqueues for Pod events and `PodConfigMapConfig` events. This allows for independent processing and rate limiting if necessary. It's understood that updates made by the controller (e.g., to a ConfigMap or a `PodConfigMapConfig` status) can trigger further watch events and requeues, which is a natural part of the reconciliation loop. Periodic resyncs (a default behavior in `controller-runtime`) also ensure that all objects are eventually reconciled, even if some watch events are missed.
-
-## Future Enhancements
-
-*   **ConfigMap Data Templating**: Allow `PodConfigMapConfig.spec.configMapDataTemplate` to define Go templates for the `data` section of the generated ConfigMap, enabling highly flexible configuration generation based on Pod metadata.
-*   **Enhanced Status Conditions**: Beyond `observedGeneration`, implement a standard `status.conditions` array on `PodConfigMapConfig` to provide more detailed status reporting (e.g., "Ready", "ErrorInPodSelector").
-*   **Validation Webhooks**: Add validating admission webhooks for the `PodConfigMapConfig` CRD to provide earlier feedback on invalid configurations (e.g., malformed `podSelector` or template syntax errors).
-*   **Metrics**: Expose Prometheus metrics for controller operations (e.g., number of ConfigMaps managed, reconciliation latency, errors).
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues, and pull requests.
