@@ -1,7 +1,5 @@
 # PodConfigMapController
 
-## Overview
-
 The K8s Pod ConfigMap Controller is a Kubernetes controller that dynamically generates and manages ConfigMaps based on the metadata of running Pods. Its behavior is configured through a Custom Resource Definition (CRD) called `PodConfigMapConfig`, allowing users to specify which Pods to target and what information to include in the generated ConfigMaps.
 
 This controller helps in scenarios where you need Pod-specific information to be available as a ConfigMap, for example, to be consumed by other applications, monitoring systems, or for easier debugging and visibility into Pod metadata.
