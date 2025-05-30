@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podconfigmap-controller
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: podconfigmap-controller
+  template:
+    metadata:
+      labels:
+        app: podconfigmap-controller
+    spec:
+      serviceAccountName: podconfigmap-controller
+      containers:
+      - name: controller
+        image: rockswe/k8s-podconfigmapcontroller:latest
+        imagePullPolicy: Always
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        # Consider adding livenessProbe and readinessProbe if an HTTP endpoint is exposed
+        # livenessProbe:
+        #   httpGet:
+        #     path: /healthz
+        #     port: 8080 # Example port
+        #   initialDelaySeconds: 15
+        #   periodSeconds: 20
+        # readinessProbe:
+        #   httpGet:
+        #     path: /readyz
+        #     port: 8080 # Example port
+        #   initialDelaySeconds: 5
+        #   periodSeconds: 10

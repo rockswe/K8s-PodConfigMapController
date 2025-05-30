@@ -1,0 +1,40 @@
+# manifests/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podconfigmap-controller
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podconfigmap-controller
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["podconfig.example.com"]
+    resources: ["podconfigmapconfigs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["podconfig.example.com"]
+    resources: ["podconfigmapconfigs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podconfigmap-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podconfigmap-controller
+subjects:
+  - kind: ServiceAccount
+    name: podconfigmap-controller
+    namespace: default

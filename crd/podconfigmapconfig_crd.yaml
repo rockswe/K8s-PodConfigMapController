@@ -1,0 +1,82 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: podconfigmapconfigs.podconfig.example.com
+spec:
+  group: podconfig.example.com
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "PodConfigMapConfig is the Schema for the podconfigmapconfigs API"
+          properties:
+            spec:
+              type: object
+              description: "PodConfigMapConfigSpec defines the desired state of PodConfigMapConfig"
+              properties:
+                labelsToInclude:
+                  type: array
+                  description: "LabelsToInclude specifies which Pod labels to include in the ConfigMap."
+                  items:
+                    type: string
+                annotationsToInclude:
+                  type: array
+                  description: "AnnotationsToInclude specifies which Pod annotations to include in the ConfigMap."
+                  items:
+                    type: string
+                podSelector:
+                  type: object
+                  description: "PodSelector selects which Pods this configuration applies to. If nil, applies to all Pods in the namespace for this PCMC."
+                  properties:
+                    matchLabels:
+                      type: object
+                      description: "matchLabels is a map of {key,value} pairs."
+                      additionalProperties:
+                        type: string
+                    matchExpressions:
+                      type: array
+                      description: "matchExpressions is a list of label selector requirements."
+                      items:
+                        type: object
+                        properties:
+                          key:
+                            type: string
+                            description: "key is the label key that the selector applies to."
+                          operator:
+                            type: string
+                            description: "operator represents a key's relationship to a set of values."
+                          values:
+                            type: array
+                            description: "values is an array of string values."
+                            items:
+                              type: string
+                        required:
+                          - key
+                          - operator
+            status:
+              type: object
+              description: "PodConfigMapConfigStatus defines the observed state of PodConfigMapConfig"
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  description: "ObservedGeneration reflects the generation of the PodConfigMapConfig spec that has been processed by the controller."
+      additionalPrinterColumns:
+        - name: ObservedGeneration
+          type: integer
+          description: "The generation of the spec that was last processed by the controller"
+          jsonPath: ".status.observedGeneration"
+        - name: PodSelectorMatchLabels
+          type: string
+          description: "The matchLabels part of the podSelector, if specified."
+          jsonPath: ".spec.podSelector.matchLabels"
+  scope: Namespaced
+  names:
+    plural: podconfigmapconfigs
+    singular: podconfigmapconfig
+    kind: PodConfigMapConfig
+    shortNames:
+    - pcmc 

@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podconfigmapcontroller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+    spec:
+      containers:
+        - name: manager
+          image: yourrepo/podconfigmapcontroller:latest
+          command:
+            - /manager
+          args:
+            - --enable-leader-election
+          ports:
+            - containerPort: 9443
+              name: webhook-server
+          resources:
+            {}
