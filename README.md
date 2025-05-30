@@ -1,4 +1,4 @@
-# Pod ConfigMap Controller
+# PodConfigMapController
 
 ## Overview
 
