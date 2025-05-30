@@ -1,4 +1,4 @@
-# K8s Pod ConfigMap Controller
+# Pod ConfigMap Controller
 
 ## Overview
 
