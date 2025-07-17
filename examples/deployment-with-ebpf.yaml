@@ -1,0 +1,265 @@
+# Full deployment example with eBPF support
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podconfigmap-controller
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podconfigmap-controller
+rules:
+- apiGroups: [""]
+  resources: ["pods", "configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["podconfig.example.com"]
+  resources: ["podconfigmapconfigs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podconfigmap-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podconfigmap-controller
+subjects:
+- kind: ServiceAccount
+  name: podconfigmap-controller
+  namespace: default
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podconfigmap-controller-metrics
+  namespace: default
+  labels:
+    app: podconfigmap-controller
+spec:
+  selector:
+    app: podconfigmap-controller
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podconfigmap-controller
+  namespace: default
+  labels:
+    app: podconfigmap-controller
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: podconfigmap-controller
+  template:
+    metadata:
+      labels:
+        app: podconfigmap-controller
+    spec:
+      serviceAccountName: podconfigmap-controller
+      containers:
+      - name: controller
+        image: podconfigmap-controller:latest
+        imagePullPolicy: IfNotPresent
+        
+        # Security context for eBPF capabilities
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - SYS_ADMIN  # Required for eBPF program loading
+            - NET_ADMIN  # Required for TC program attachment
+            - BPF        # Required for BPF operations
+            drop:
+            - ALL
+        
+        # Environment variables for leader election
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LEADER_ELECTION_ENABLED
+          value: "true"
+        - name: LEADER_ELECTION_LEASE_DURATION
+          value: "15s"
+        - name: LEADER_ELECTION_RENEW_DEADLINE
+          value: "10s"
+        - name: LEADER_ELECTION_RETRY_PERIOD
+          value: "2s"
+        - name: LEADER_ELECTION_LOCK_NAME
+          value: "podconfigmap-controller-lock"
+        - name: LEADER_ELECTION_LOCK_NAMESPACE
+          value: "default"
+        - name: CONTROLLER_RESYNC_PERIOD
+          value: "10m"
+        - name: METRICS_ADDR
+          value: ":8080"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "text"
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"  # Higher limit for eBPF maps
+            cpu: "500m"
+        
+        # Ports
+        ports:
+        - containerPort: 8080
+          name: metrics
+          protocol: TCP
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Volume mounts for eBPF
+        volumeMounts:
+        - name: bpf-maps
+          mountPath: /sys/fs/bpf
+          mountPropagation: HostToContainer
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+          readOnly: true
+        
+      # Volumes for eBPF functionality
+      volumes:
+      - name: bpf-maps
+        hostPath:
+          path: /sys/fs/bpf
+          type: DirectoryOrCreate
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+          type: Directory
+      
+      # Node selector for eBPF-capable nodes
+      nodeSelector:
+        kubernetes.io/os: linux
+      
+      # Tolerations for system workloads
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      
+      # Affinity for high availability
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: podconfigmap-controller
+              topologyKey: kubernetes.io/hostname
+
+---
+# ServiceMonitor for Prometheus scraping
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: podconfigmap-controller
+  namespace: default
+  labels:
+    app: podconfigmap-controller
+spec:
+  selector:
+    matchLabels:
+      app: podconfigmap-controller
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+    scrapeTimeout: 10s
+
+---
+# PrometheusRule for alerting
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: podconfigmap-controller-alerts
+  namespace: default
+  labels:
+    app: podconfigmap-controller
+spec:
+  groups:
+  - name: podconfigmap-controller-ebpf
+    rules:
+    - alert: EBPFProgramAttachFailure
+      expr: rate(podconfigmap_controller_ebpf_program_errors_total[5m]) > 0
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "eBPF program attachment failures detected"
+        description: "Controller {{ $labels.pod_name }} is experiencing eBPF program attachment failures"
+    
+    - alert: HighSyscallRate
+      expr: rate(podconfigmap_controller_ebpf_syscall_count_total[1m]) > 1000
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High syscall rate detected"
+        description: "Pod {{ $labels.pod_name }} in namespace {{ $labels.namespace }} has a high syscall rate"
+    
+    - alert: ControllerLeaderElectionFailure
+      expr: absent(podconfigmap_controller_leader_election_status) == 1
+      for: 30s
+      labels:
+        severity: critical
+      annotations:
+        summary: "Controller leader election failure"
+        description: "PodConfigMapController leader election is failing"
+    
+    - alert: EBPFFirewallHighBlockRate
+      expr: rate(podconfigmap_controller_ebpf_l4_firewall_total{stat_type="blocked"}[5m]) > 10
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High L4 firewall block rate"
+        description: "Pod {{ $labels.pod_name }} has high L4 firewall block rate"

@@ -1,0 +1,99 @@
+# Example PodConfigMapConfig with eBPF features enabled
+apiVersion: podconfig.example.com/v1alpha1
+kind: PodConfigMapConfig
+metadata:
+  name: example-ebpf-config
+  namespace: default
+spec:
+  # Standard ConfigMap generation
+  labelsToInclude:
+    - app
+    - version
+    - tier
+  annotationsToInclude:
+    - deployment.kubernetes.io/revision
+    - kubernetes.io/created-by
+  
+  # Target specific pods
+  podSelector:
+    matchLabels:
+      app: my-app
+      tier: frontend
+  
+  # eBPF configuration
+  ebpfConfig:
+    # Enable syscall monitoring
+    syscallMonitoring:
+      enabled: true
+      syscallNames: 
+        - read
+        - write
+        - open
+        - close
+        - connect
+        - accept
+    
+    # Enable L4 firewall
+    l4Firewall:
+      enabled: true
+      allowedPorts: [80, 443, 8080, 8443]
+      blockedPorts: [22, 23, 3389, 1433, 3306]
+      defaultAction: allow
+    
+    # Enable metrics export
+    metricsExport:
+      enabled: true
+      updateInterval: "30s"
+
+---
+# Example deployment that will be monitored
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-app
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+      tier: frontend
+  template:
+    metadata:
+      labels:
+        app: my-app
+        tier: frontend
+        version: v1.0.0
+      annotations:
+        deployment.kubernetes.io/revision: "1"
+        kubernetes.io/created-by: "example-deployment"
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "64Mi"
+            cpu: "100m"
+
+---
+# Example service
+apiVersion: v1
+kind: Service
+metadata:
+  name: example-app-service
+  namespace: default
+spec:
+  selector:
+    app: my-app
+    tier: frontend
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+  type: ClusterIP

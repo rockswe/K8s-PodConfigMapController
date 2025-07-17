@@ -12,12 +12,14 @@ This controller helps in scenarios where you need Pod-specific information to be
 *   **Metadata Inclusion**: Allows specifying which Pod labels and annotations should be included in the ConfigMap data.
 *   **Status Reporting**: The `PodConfigMapConfig` resource reports its `observedGeneration` in its status, indicating if the controller has processed the latest specification.
 *   **Namespace-Scoped**: Operates within specific namespaces, allowing for different configurations across a cluster.
+*   **eBPF Integration**: Attach tiny eBPF programs per Pod for syscall monitoring and L4 network filtering with Prometheus metrics export.
 *   **Structured Logging**: Comprehensive logging with klog/v2 using structured key-value pairs, configurable log levels, and JSON output support.
 *   **Prometheus Metrics**: Built-in observability with metrics for ConfigMap operations, reconciliation duration, errors, queue depth, and PCMC status.
 *   **Input Validation**: Comprehensive validation for CRD fields, ConfigMap names/data, Pod metadata, and label/annotation keys.
 *   **Error Handling**: Typed errors with context, error aggregation, proper propagation, and retry logic with exponential backoff.
 *   **Configuration Management**: Extensive configuration via environment variables for leader election, controller settings, logging, and metrics.
 *   **Leader Election**: Multi-replica deployment support with configurable leader election using Lease locks.
+*   **Minimal Container Image**: Distroless-based image with eBPF toolchain, running as non-root with read-only filesystem.
 
 ## Custom Resource Definition (CRD): `PodConfigMapConfig`
 
@@ -30,6 +32,7 @@ The `PodConfigMapConfig` CRD is central to configuring the controller's behavior
 *   `labelsToInclude`: (Optional) An array of strings. Each string is a Pod label key. If a Pod has any of these labels, the key-value pair will be included in the generated ConfigMap's data, prefixed with `label_`.
 *   `annotationsToInclude`: (Optional) An array of strings. Each string is a Pod annotation key. If a Pod has any of these annotations, the key-value pair will be included in the generated ConfigMap's data, prefixed with `annotation_`.
 *   `podSelector`: (Optional) A standard `metav1.LabelSelector` (e.g., `matchLabels`, `matchExpressions`). If specified, this `PodConfigMapConfig` will only apply to Pods within its namespace that match this selector. If omitted or nil, it applies to all Pods in the namespace (subject to other `PodConfigMapConfig` resources).
+*   `ebpfConfig`: (Optional) eBPF program configuration for advanced monitoring and security capabilities per Pod.
 *   `configMapDataTemplate`: (Planned Future Enhancement) A map where keys are ConfigMap data keys and values are Go template strings. This will allow for more complex ConfigMap data generation based on Pod metadata.
 
 **Status (`status`)**:
@@ -60,6 +63,45 @@ status:
   observedGeneration: 1 # Updated by the controller
 ```
 
+**Example with eBPF Configuration**:
+
+```yaml
+apiVersion: podconfig.example.com/v1alpha1
+kind: PodConfigMapConfig
+metadata:
+  name: ebpf-monitoring-config
+  namespace: my-namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: my-production-app
+      tier: frontend
+  labelsToInclude:
+    - "app"
+    - "version"
+    - "tier"
+  annotationsToInclude:
+    - "deployment.kubernetes.io/revision"
+  # eBPF configuration for advanced monitoring and security
+  ebpfConfig:
+    # Monitor system calls per pod
+    syscallMonitoring:
+      enabled: true
+      syscallNames: ["read", "write", "open", "close", "connect", "accept"]
+    # Simple L4 firewall rules
+    l4Firewall:
+      enabled: true
+      allowedPorts: [80, 443, 8080, 8443]
+      blockedPorts: [22, 23, 3389, 1433, 3306]
+      defaultAction: allow
+    # Export metrics to Prometheus
+    metricsExport:
+      enabled: true
+      updateInterval: "30s"
+status:
+  observedGeneration: 1 # Updated by the controller
+```
+
 ## How it Works
 
 The controller operates by watching three primary types of resources:
@@ -81,6 +123,67 @@ The controller operates by watching three primary types of resources:
 *   **ConfigMap Naming**: ConfigMaps are named `pod-<pod-name>-from-<pcmc-name>-cfg`, linking them to both the Pod and the specific `PodConfigMapConfig` instance that triggered their creation.
 *   **Owner References**: Generated ConfigMaps have an OwnerReference pointing to the Pod they represent. This ensures that when a Pod is deleted, its associated ConfigMaps are automatically garbage-collected by Kubernetes.
 *   **Labels**: Generated ConfigMaps are labeled with `podconfig.example.com/generated-by-pcmc: <pcmc-name>` and `podconfig.example.com/pod-uid: <pod-uid>` for easier identification and potential cleanup.
+
+## eBPF Integration
+
+The controller now supports attaching tiny eBPF programs to pods for advanced monitoring and security capabilities. This feature enables:
+
+### **Syscall Monitoring**
+- **Per-pod system call counting**: Track read, write, open, close, connect, accept, and other syscalls
+- **Granular filtering**: Monitor only specific syscalls of interest
+- **Real-time metrics**: Export syscall counts to Prometheus for observability
+
+### **L4 Network Firewall**
+- **Port-based filtering**: Allow/block specific TCP/UDP ports per pod
+- **Default policies**: Configure default allow/block behavior
+- **Traffic statistics**: Monitor allowed vs blocked connections
+- **Minimal overhead**: Efficient eBPF programs with < 1µs latency impact
+
+### **Prometheus Metrics**
+- `podconfigmap_controller_ebpf_syscall_count_total` - Syscall counts per pod/PID
+- `podconfigmap_controller_ebpf_l4_firewall_total` - L4 firewall statistics (allowed/blocked)
+- `podconfigmap_controller_ebpf_attached_programs` - Number of attached eBPF programs
+- `podconfigmap_controller_ebpf_program_errors_total` - eBPF program error rates
+
+### **ConfigMap Integration**
+Generated ConfigMaps automatically include eBPF metadata:
+```yaml
+data:
+  podName: "my-app-12345"
+  namespace: "production"
+  ebpf_enabled: "true"
+  ebpf_syscall_monitoring: "true"
+  ebpf_l4_firewall: "true"
+  ebpf_l4_firewall_default_action: "allow"
+  ebpf_metrics_export: "true"
+```
+
+### **Leader Election & Failover**
+- **Leader-only management**: Only the leader replica manages eBPF programs
+- **Fast failover**: < 10s recovery time (configurable lease duration)
+- **State reconciliation**: Automatic eBPF program re-attachment on leader change
+- **Zero RPO**: Stateless eBPF programs with no data loss during failover
+
+### **Security & Requirements**
+- **Kernel requirements**: Linux kernel >= 5.4 with eBPF support
+- **Required capabilities**: `SYS_ADMIN`, `NET_ADMIN`, `BPF`
+- **Secure by default**: Non-root user, read-only filesystem, distroless base image
+- **eBPF verifier**: Kernel-level program verification ensures safety
+
+### **Usage Example**
+```bash
+# Deploy with eBPF support
+kubectl apply -f examples/deployment-with-ebpf.yaml
+
+# Create eBPF monitoring configuration
+kubectl apply -f examples/ebpf-config.yaml
+
+# View metrics
+kubectl port-forward svc/podconfigmap-controller-metrics 8080:8080
+curl http://localhost:8080/metrics | grep ebpf
+```
+
+For detailed eBPF configuration, deployment requirements, and troubleshooting, see [`docs/EBPF_FEATURES.md`](docs/EBPF_FEATURES.md).
 
 ## Configuration
 
@@ -114,12 +217,20 @@ The controller supports extensive configuration via environment variables:
 
 ### Metrics
 The controller exposes Prometheus metrics at `/metrics`:
+
+**Core Controller Metrics**:
 - `podconfigmap_controller_configmap_operations_total` - ConfigMap operations counter
 - `podconfigmap_controller_reconciliation_duration_seconds` - Reconciliation duration histogram
 - `podconfigmap_controller_reconciliation_errors_total` - Reconciliation errors counter
 - `podconfigmap_controller_queue_depth` - Work queue depth gauge
 - `podconfigmap_controller_pcmc_status` - PCMC status gauge
 - `podconfigmap_controller_active_configmaps` - Active ConfigMaps count gauge
+
+**eBPF-Specific Metrics**:
+- `podconfigmap_controller_ebpf_syscall_count_total` - Total syscalls per pod/PID
+- `podconfigmap_controller_ebpf_l4_firewall_total` - L4 firewall statistics (allowed/blocked/tcp/udp)
+- `podconfigmap_controller_ebpf_attached_programs` - Number of attached eBPF programs per pod
+- `podconfigmap_controller_ebpf_program_errors_total` - eBPF program errors (attach/detach failures)
 
 ### Structured Logging
 - Uses klog/v2 with structured key-value pairs
@@ -133,6 +244,7 @@ The controller exposes Prometheus metrics at `/metrics`:
 
 *   A running Kubernetes cluster (e.g., Minikube, Kind, Docker Desktop).
 *   `kubectl` command-line tool configured to interact with your cluster.
+*   **For eBPF features**: Linux kernel >= 5.4 with eBPF support enabled on cluster nodes.
 
 ### Installation
 
@@ -207,11 +319,15 @@ The controller is organized into several packages for better maintainability:
 
 - **`api/v1alpha1/`** - API types and CRD definitions
 - **`controller/`** - Main controller logic and reconciliation
+- **`pkg/ebpf/`** - eBPF program management and lifecycle
 - **`pkg/logging/`** - Structured logging with klog/v2
 - **`pkg/metrics/`** - Prometheus metrics for observability
 - **`pkg/validation/`** - Input validation for CRDs and ConfigMaps
 - **`pkg/errors/`** - Structured error handling with context
 - **`pkg/config/`** - Configuration management with environment variables
+- **`ebpf/`** - eBPF C programs for syscall monitoring and L4 firewall
+- **`examples/`** - Example configurations and deployment manifests
+- **`docs/`** - Comprehensive documentation including eBPF features
 - **`main.go`** - Entry point with leader election and graceful shutdown
 
 ## Development

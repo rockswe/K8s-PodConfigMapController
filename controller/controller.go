@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	v1alpha1 "github.com/rockswe/K8s-PodConfigMapController/api/v1alpha1"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/ebpf"
 	"github.com/rockswe/K8s-PodConfigMapController/pkg/errors"
 	"github.com/rockswe/K8s-PodConfigMapController/pkg/logging"
 	"github.com/rockswe/K8s-PodConfigMapController/pkg/metrics"
@@ -43,6 +44,7 @@ type Controller struct {
 	podQueue      workqueue.RateLimitingInterface
 	pcmcQueue     workqueue.RateLimitingInterface
 	logger        *logging.Logger
+	ebpfManager   *ebpf.Manager
 }
 
 func NewController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interface) (*Controller, error) {
@@ -64,6 +66,7 @@ func NewController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interf
 		podQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
 		pcmcQueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "podconfigmapconfigs"),
 		logger:        logger,
+		ebpfManager:   ebpf.NewManager(kubeClient),
 	}
 
 	logger.Info("Setting up event handlers")
@@ -155,6 +158,13 @@ func (c *Controller) Run(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), c.podInformer.HasSynced, c.pcmcInformer.HasSynced) {
 		return errors.NewInternalError("cache-sync", "informers", "failed to wait for caches to sync", nil)
 	}
+
+	c.logger.Info("Starting eBPF manager")
+	go func() {
+		if err := c.ebpfManager.Start(ctx); err != nil {
+			c.logger.Error(err, "eBPF manager failed")
+		}
+	}()
 
 	c.logger.Info("Controller caches synchronized. Starting processing loops.")
 	go c.runPodWorker(ctx)
@@ -279,6 +289,16 @@ func (c *Controller) reconcilePod(ctx context.Context, key string) error {
 				lastErr = errSync
 			}
 		}
+		
+		// Handle eBPF program attachment/detachment
+		if pcmcCopy.Spec.EBPFConfig != nil {
+			if err := c.handleEBPFForPod(ctx, pod.DeepCopy(), pcmcCopy); err != nil {
+				c.logger.Error(err, "Error handling eBPF for Pod", "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", typedPcmc.Name)
+				if lastErr == nil {
+					lastErr = err
+				}
+			}
+		}
 	}
 	return lastErr
 }
@@ -332,6 +352,16 @@ func (c *Controller) reconcilePcmc(ctx context.Context, key string, isDelete boo
 			c.logger.Error(errSync, "Error syncing ConfigMap for Pod upon PCMC change", "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", typedPcmc.Name)
 			if lastErr == nil {
 				lastErr = errSync
+			}
+		}
+		
+		// Handle eBPF program attachment/detachment
+		if pcmcCopy.Spec.EBPFConfig != nil {
+			if err := c.handleEBPFForPod(ctx, pod.DeepCopy(), pcmcCopy); err != nil {
+				c.logger.Error(err, "Error handling eBPF for Pod upon PCMC change", "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", typedPcmc.Name)
+				if lastErr == nil {
+					lastErr = err
+				}
 			}
 		}
 	}
@@ -484,6 +514,23 @@ func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc 
 		"phase":     string(pod.Status.Phase),
 		"pcmcName":  pcmc.Name,
 	}
+	
+	// Add eBPF configuration metadata
+	if pcmc.Spec.EBPFConfig != nil {
+		configData["ebpf_enabled"] = "true"
+		if pcmc.Spec.EBPFConfig.SyscallMonitoring != nil {
+			configData["ebpf_syscall_monitoring"] = fmt.Sprintf("%t", pcmc.Spec.EBPFConfig.SyscallMonitoring.Enabled)
+		}
+		if pcmc.Spec.EBPFConfig.L4Firewall != nil {
+			configData["ebpf_l4_firewall"] = fmt.Sprintf("%t", pcmc.Spec.EBPFConfig.L4Firewall.Enabled)
+			configData["ebpf_l4_firewall_default_action"] = string(pcmc.Spec.EBPFConfig.L4Firewall.DefaultAction)
+		}
+		if pcmc.Spec.EBPFConfig.MetricsExport != nil {
+			configData["ebpf_metrics_export"] = fmt.Sprintf("%t", pcmc.Spec.EBPFConfig.MetricsExport.Enabled)
+		}
+	} else {
+		configData["ebpf_enabled"] = "false"
+	}
 
 	for _, labelKey := range pcmc.Spec.LabelsToInclude {
 		if val, ok := pod.Labels[labelKey]; ok {
@@ -566,4 +613,41 @@ func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc 
 		}
 		return updateErr
 	})
+}
+
+func (c *Controller) handleEBPFForPod(ctx context.Context, pod *v1.Pod, pcmc *v1alpha1.PodConfigMapConfig) error {
+	if pcmc.Spec.EBPFConfig == nil {
+		return nil
+	}
+	
+	// Check if pod matches selector
+	if pcmc.Spec.PodSelector != nil {
+		selector, err := metav1.LabelSelectorAsSelector(pcmc.Spec.PodSelector)
+		if err != nil {
+			return fmt.Errorf("invalid podSelector: %w", err)
+		}
+		if !selector.Matches(labels.Set(pod.Labels)) {
+			// Pod doesn't match selector, detach eBPF programs
+			if err := c.ebpfManager.DetachFromPod(ctx, pod); err != nil {
+				return fmt.Errorf("failed to detach eBPF programs from pod: %w", err)
+			}
+			return nil
+		}
+	}
+	
+	// Pod matches selector or no selector specified, attach eBPF programs
+	if err := c.ebpfManager.AttachToPod(ctx, pod, pcmc.Spec.EBPFConfig); err != nil {
+		metrics.RecordEBPFProgramError(pod.Namespace, pod.Name, "attach", err.Error())
+		return fmt.Errorf("failed to attach eBPF programs to pod: %w", err)
+	}
+	
+	// Update metrics
+	if pcmc.Spec.EBPFConfig.SyscallMonitoring != nil && pcmc.Spec.EBPFConfig.SyscallMonitoring.Enabled {
+		metrics.SetEBPFAttachedPrograms(pod.Namespace, pod.Name, "syscall_counter", 1)
+	}
+	if pcmc.Spec.EBPFConfig.L4Firewall != nil && pcmc.Spec.EBPFConfig.L4Firewall.Enabled {
+		metrics.SetEBPFAttachedPrograms(pod.Namespace, pod.Name, "l4_firewall", 1)
+	}
+	
+	return nil
 }
