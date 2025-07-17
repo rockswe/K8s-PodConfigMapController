@@ -4,13 +4,16 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rockswe/K8s-PodConfigMapController/controller"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/errors"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/logging"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -19,24 +22,54 @@ import (
 )
 
 func main() {
+	// Setup logging
+	logging.SetupLogging()
+	logger := logging.NewLogger("main")
+
 	var kubeconfig string
+	var metricsAddr string
+	var leaseDuration time.Duration
+	var renewDeadline time.Duration
+	var retryPeriod time.Duration
+
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
+	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "address to serve metrics on")
+	flag.DurationVar(&leaseDuration, "lease-duration", 15*time.Second, "leader election lease duration")
+	flag.DurationVar(&renewDeadline, "renew-deadline", 10*time.Second, "leader election renew deadline")
+	flag.DurationVar(&retryPeriod, "retry-period", 2*time.Second, "leader election retry period")
 	flag.Parse()
+
+	logger.Info("Starting PodConfigMapController", "version", "v1.0.0")
 
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		log.Fatalf("Error creating kubeconfig: %v", err)
+		controllerErr := errors.NewConfigurationError("build-config", "kubeconfig", "failed to build kubeconfig", err)
+		logger.Error(controllerErr, "Failed to build kubeconfig")
+		os.Exit(1)
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Error creating kubernetes clientset: %v", err)
+		controllerErr := errors.NewConfigurationError("create-client", "kubernetes", "failed to create kubernetes client", err)
+		logger.Error(controllerErr, "Failed to create kubernetes client")
+		os.Exit(1)
 	}
 
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Error creating dynamic client: %v", err)
+		controllerErr := errors.NewConfigurationError("create-client", "dynamic", "failed to create dynamic client", err)
+		logger.Error(controllerErr, "Failed to create dynamic client")
+		os.Exit(1)
 	}
+
+	// Start metrics server
+	go func() {
+		logger.Info("Starting metrics server", "address", metricsAddr)
+		http.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
+			logger.Error(err, "Failed to start metrics server")
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -44,7 +77,7 @@ func main() {
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-stopCh
-		log.Println("Shutdown signal received, exiting...")
+		logger.Info("Shutdown signal received, exiting gracefully")
 		cancel()
 	}()
 
@@ -56,14 +89,16 @@ func main() {
 		var errHostname error
 		leaderElectionID, errHostname = os.Hostname()
 		if errHostname != nil {
-			log.Fatalf("Error getting hostname: %v", errHostname)
+			controllerErr := errors.NewConfigurationError("get-hostname", "hostname", "failed to get hostname for leader election", errHostname)
+			logger.Error(controllerErr, "Failed to get hostname for leader election")
+			os.Exit(1)
 		}
-		log.Println("POD_NAME environment variable not set, using hostname for leader election ID.")
+		logger.Warning("POD_NAME environment variable not set, using hostname for leader election ID")
 	}
 
 	lockNamespace := os.Getenv("POD_NAMESPACE")
 	if lockNamespace == "" {
-		log.Println("POD_NAMESPACE environment variable not set, defaulting to 'default' for leader lock.")
+		logger.Warning("POD_NAMESPACE environment variable not set, defaulting to 'default' for leader lock")
 		lockNamespace = "default"
 	}
 
@@ -76,34 +111,42 @@ func main() {
 			Identity: leaderElectionID,
 		})
 	if err != nil {
-		log.Fatalf("Error creating resource lock: %v", err)
+		controllerErr := errors.NewConfigurationError("create-lock", "resourcelock", "failed to create resource lock", err)
+		logger.Error(controllerErr, "Failed to create resource lock")
+		os.Exit(1)
 	}
+
+	logger.Info("Starting leader election", "identity", leaderElectionID, "namespace", lockNamespace)
 
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:          rl,
-		LeaseDuration: 15 * time.Second,
-		RenewDeadline: 10 * time.Second,
-		RetryPeriod:   2 * time.Second,
+		LeaseDuration: leaseDuration,
+		RenewDeadline: renewDeadline,
+		RetryPeriod:   retryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				log.Println("Leadership acquired, starting controller")
+				logger.Info("Leadership acquired, starting controller")
 				ctrl, err := controller.NewController(kubeClient, dynamicClient)
 				if err != nil {
-					log.Fatalf("Error creating controller: %v", err)
+					controllerErr := errors.NewInternalError("create-controller", "controller", "failed to create controller", err)
+					logger.Error(controllerErr, "Failed to create controller")
+					os.Exit(1)
 				}
 				if err := ctrl.Run(ctx); err != nil {
-					log.Fatalf("Error running controller: %v", err)
+					controllerErr := errors.NewInternalError("run-controller", "controller", "controller run failed", err)
+					logger.Error(controllerErr, "Controller run failed")
+					os.Exit(1)
 				}
 			},
 			OnStoppedLeading: func() {
-				log.Println("Leadership lost, shutting down")
+				logger.Info("Leadership lost, shutting down")
 				os.Exit(0)
 			},
 			OnNewLeader: func(identity string) {
 				if identity == leaderElectionID {
 					return
 				}
-				log.Printf("New leader elected: %s\n", identity)
+				logger.Info("New leader elected", "identity", identity)
 			},
 		},
 	})

@@ -3,13 +3,12 @@ package controller
 import (
 	"context"
 	"fmt"
-	"log"
 	"reflect"
 	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	api_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -25,6 +24,10 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	v1alpha1 "github.com/rockswe/K8s-PodConfigMapController/api/v1alpha1"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/errors"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/logging"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/metrics"
+	"github.com/rockswe/K8s-PodConfigMapController/pkg/validation"
 )
 
 var (
@@ -39,9 +42,13 @@ type Controller struct {
 	pcmcInformer  cache.SharedIndexInformer
 	podQueue      workqueue.RateLimitingInterface
 	pcmcQueue     workqueue.RateLimitingInterface
+	logger        *logging.Logger
 }
 
 func NewController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interface) (*Controller, error) {
+	logger := logging.NewLogger("controller")
+	logger.Info("Creating new controller")
+
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, time.Minute*10)
 	podInformer := kubeInformerFactory.Core().V1().Pods().Informer()
 
@@ -56,9 +63,10 @@ func NewController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interf
 		pcmcInformer:  pcmcInformer,
 		podQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
 		pcmcQueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "podconfigmapconfigs"),
+		logger:        logger,
 	}
 
-	log.Println("Setting up event handlers")
+	logger.Info("Setting up event handlers")
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.enqueuePod,
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -85,7 +93,7 @@ func NewController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interf
 			oldUnst, okOld := oldObj.(*unstructured.Unstructured)
 			newUnst, okNew := newObj.(*unstructured.Unstructured)
 			if !okOld || !okNew {
-				log.Printf("PCMC Update: failed to cast to Unstructured. Old: %T, New: %T", oldObj, newObj)
+				logger.Warning("PCMC Update: failed to cast to Unstructured", "oldType", fmt.Sprintf("%T", oldObj), "newType", fmt.Sprintf("%T", newObj))
 				if key, err := cache.MetaNamespaceKeyFunc(newObj); err == nil {
 					c.pcmcQueue.Add(key)
 				}
@@ -107,50 +115,53 @@ func NewController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interf
 func (c *Controller) enqueuePod(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
-		log.Printf("Error getting key for pod object: %v", err)
+		c.logger.Error(err, "Error getting key for pod object")
 		return
 	}
 	c.podQueue.Add(key)
+	metrics.SetQueueDepth("pods", c.podQueue.Len())
 }
 
 func (c *Controller) enqueuePcmc(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
-		log.Printf("Error getting key for PCMC object: %v (type: %T)", err, obj)
+		c.logger.Error(err, "Error getting key for PCMC object", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 	c.pcmcQueue.Add(key)
+	metrics.SetQueueDepth("podconfigmapconfigs", c.pcmcQueue.Len())
 }
 
 func (c *Controller) enqueuePcmcForDelete(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
-		log.Printf("Error getting key for deleted PCMC object: %v", err)
+		c.logger.Error(err, "Error getting key for deleted PCMC object")
 		return
 	}
 	c.pcmcQueue.Add("DELETED:" + key)
+	metrics.SetQueueDepth("podconfigmapconfigs", c.pcmcQueue.Len())
 }
 
 func (c *Controller) Run(ctx context.Context) error {
 	defer c.podQueue.ShutDown()
 	defer c.pcmcQueue.ShutDown()
 
-	log.Println("Starting Pod informer")
+	c.logger.Info("Starting Pod informer")
 	go c.podInformer.Run(ctx.Done())
-	log.Println("Starting PodConfigMapConfig informer")
+	c.logger.Info("Starting PodConfigMapConfig informer")
 	go c.pcmcInformer.Run(ctx.Done())
 
-	log.Println("Waiting for informer caches to sync")
+	c.logger.Info("Waiting for informer caches to sync")
 	if !cache.WaitForCacheSync(ctx.Done(), c.podInformer.HasSynced, c.pcmcInformer.HasSynced) {
-		return fmt.Errorf("failed to wait for caches to sync")
+		return errors.NewInternalError("cache-sync", "informers", "failed to wait for caches to sync", nil)
 	}
 
-	log.Println("Controller caches synchronized. Starting processing loops.")
+	c.logger.Info("Controller caches synchronized. Starting processing loops.")
 	go c.runPodWorker(ctx)
 	go c.runPcmcWorker(ctx)
 
 	<-ctx.Done()
-	log.Println("Shutting down workers")
+	c.logger.Info("Shutting down workers")
 	return nil
 }
 
@@ -170,10 +181,15 @@ func (c *Controller) processNextPodWorkItem(ctx context.Context) bool {
 		return false
 	}
 	defer c.podQueue.Done(key)
+	defer metrics.SetQueueDepth("pods", c.podQueue.Len())
 
+	start := time.Now()
 	err := c.reconcilePod(ctx, key.(string))
+	metrics.RecordReconciliationDuration("pod", "", time.Since(start).Seconds())
+
 	if err != nil {
-		log.Printf("Error syncing Pod '%s': %v", key, err)
+		c.logger.Error(err, "Error syncing Pod", "key", key)
+		metrics.RecordReconciliationError("pod", "", string(errors.GetErrorType(err)))
 		c.podQueue.AddRateLimited(key)
 		return true
 	}
@@ -188,6 +204,7 @@ func (c *Controller) processNextPcmcWorkItem(ctx context.Context) bool {
 		return false
 	}
 	defer c.pcmcQueue.Done(keyObj)
+	defer metrics.SetQueueDepth("podconfigmapconfigs", c.pcmcQueue.Len())
 
 	key := keyObj.(string)
 	isDelete := false
@@ -196,9 +213,13 @@ func (c *Controller) processNextPcmcWorkItem(ctx context.Context) bool {
 		key = strings.TrimPrefix(key, "DELETED:")
 	}
 
+	start := time.Now()
 	err := c.reconcilePcmc(ctx, key, isDelete)
+	metrics.RecordReconciliationDuration("pcmc", "", time.Since(start).Seconds())
+
 	if err != nil {
-		log.Printf("Error syncing PodConfigMapConfig '%s': %v", key, err)
+		c.logger.Error(err, "Error syncing PodConfigMapConfig", "key", key)
+		metrics.RecordReconciliationError("pcmc", "", string(errors.GetErrorType(err)))
 		c.pcmcQueue.AddRateLimited(keyObj)
 		return true
 	}
@@ -210,34 +231,40 @@ func (c *Controller) processNextPcmcWorkItem(ctx context.Context) bool {
 func (c *Controller) reconcilePod(ctx context.Context, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		log.Printf("Invalid resource key: %s", key)
+		c.logger.Warning("Invalid resource key", "key", key)
 		return nil
 	}
 
 	pod, err := c.podLister.Pods(namespace).Get(name)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			log.Printf("Pod '%s' in work queue no longer exists", key)
+		if api_errors.IsNotFound(err) {
+			c.logger.Debug("Pod in work queue no longer exists", "key", key)
 			return c.handleDeletedPod(ctx, namespace, name)
 		}
-		return err
+		return errors.NewAPIError("get-pod", fmt.Sprintf("pods/%s", key), "failed to get pod from lister", err)
+	}
+
+	// Validate pod before processing
+	if err := validation.ValidatePod(pod); err != nil {
+		c.logger.Warning("Skipping invalid pod", "key", key, "error", err)
+		return nil
 	}
 
 	unstructuredPcmcs, err := c.pcmcInformer.GetIndexer().ByIndex(cache.NamespaceIndex, namespace)
 	if err != nil {
-		return fmt.Errorf("failed to list PodConfigMapConfigs in namespace %s by indexer: %w", namespace, err)
+		return errors.NewAPIError("list-pcmcs", fmt.Sprintf("namespace/%s", namespace), "failed to list PodConfigMapConfigs by indexer", err)
 	}
 
 	var lastErr error
 	for _, unstructuredObj := range unstructuredPcmcs {
 		unstPcmc, ok := unstructuredObj.(*unstructured.Unstructured)
 		if !ok {
-			log.Printf("Expected Unstructured from PCMC informer but got %T in namespace %s", unstructuredObj, namespace)
+			c.logger.Warning("Expected Unstructured from PCMC informer but got different type", "type", fmt.Sprintf("%T", unstructuredObj), "namespace", namespace)
 			continue
 		}
 		typedPcmc := &v1alpha1.PodConfigMapConfig{}
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstPcmc.Object, typedPcmc); err != nil {
-			log.Printf("Failed to convert Unstructured to PodConfigMapConfig (obj: %s/%s): %v", unstPcmc.GetNamespace(), unstPcmc.GetName(), err)
+			c.logger.Error(err, "Failed to convert Unstructured to PodConfigMapConfig", "namespace", unstPcmc.GetNamespace(), "name", unstPcmc.GetName())
 			if lastErr == nil {
 				lastErr = fmt.Errorf("failed to convert PCMC %s/%s: %w", unstPcmc.GetNamespace(), unstPcmc.GetName(), err)
 			}
@@ -247,7 +274,7 @@ func (c *Controller) reconcilePod(ctx context.Context, key string) error {
 		pcmcCopy := typedPcmc.DeepCopy()
 		errSync := c.syncConfigMapForPod(ctx, pod.DeepCopy(), pcmcCopy)
 		if errSync != nil {
-			log.Printf("Error syncing ConfigMap for Pod %s/%s with PCMC %s: %v", pod.Namespace, pod.Name, typedPcmc.Name, errSync)
+			c.logger.Error(errSync, "Error syncing ConfigMap for Pod", "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", typedPcmc.Name)
 			if lastErr == nil {
 				lastErr = errSync
 			}
@@ -259,7 +286,7 @@ func (c *Controller) reconcilePod(ctx context.Context, key string) error {
 func (c *Controller) reconcilePcmc(ctx context.Context, key string, isDelete bool) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		log.Printf("Invalid resource key for PCMC: %s", key)
+		c.logger.Warning("Invalid resource key for PCMC", "key", key)
 		return nil
 	}
 
@@ -272,7 +299,7 @@ func (c *Controller) reconcilePcmc(ctx context.Context, key string, isDelete boo
 		return fmt.Errorf("error fetching PCMC '%s' from cache: %w", key, err)
 	}
 	if !exists {
-		log.Printf("PodConfigMapConfig '%s' in work queue no longer exists (handling as delete)", key)
+		c.logger.Debug("PodConfigMapConfig in work queue no longer exists (handling as delete)", "key", key)
 		return c.handleDeletedPcmc(ctx, namespace, name)
 	}
 
@@ -286,7 +313,7 @@ func (c *Controller) reconcilePcmc(ctx context.Context, key string, isDelete boo
 	}
 
 	if err := c.updatePcmcStatus(ctx, typedPcmc); err != nil {
-		log.Printf("Failed to update status for PCMC %s/%s: %v. Continuing reconciliation.", typedPcmc.Namespace, typedPcmc.Name, err)
+		c.logger.Warning("Failed to update status for PCMC. Continuing reconciliation.", "namespace", typedPcmc.Namespace, "name", typedPcmc.Name, "error", err)
 	}
 
 	pods, err := c.podLister.Pods(namespace).List(labels.Everything())
@@ -302,7 +329,7 @@ func (c *Controller) reconcilePcmc(ctx context.Context, key string, isDelete boo
 		pcmcCopy := typedPcmc.DeepCopy()
 		errSync := c.syncConfigMapForPod(ctx, pod.DeepCopy(), pcmcCopy)
 		if errSync != nil {
-			log.Printf("Error syncing ConfigMap for Pod %s/%s upon PCMC %s change: %v", pod.Namespace, pod.Name, typedPcmc.Name, errSync)
+			c.logger.Error(errSync, "Error syncing ConfigMap for Pod upon PCMC change", "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", typedPcmc.Name)
 			if lastErr == nil {
 				lastErr = errSync
 			}
@@ -318,7 +345,7 @@ func (c *Controller) updatePcmcStatus(ctx context.Context, pcmc *v1alpha1.PodCon
 		return fmt.Errorf("failed to get current PCMC %s from cache for status update: %w", key, err)
 	}
 	if !exists {
-		log.Printf("PCMC %s not found in cache for status update, perhaps it was deleted.", key)
+		c.logger.Warning("PCMC not found in cache for status update, perhaps it was deleted", "key", key)
 		return nil
 	}
 
@@ -350,7 +377,7 @@ func (c *Controller) updatePcmcStatus(ctx context.Context, pcmc *v1alpha1.PodCon
 	if err != nil {
 		return fmt.Errorf("failed to update status for PCMC %s: %w", key, err)
 	}
-	log.Printf("Successfully updated status for PCMC %s to observedGeneration %d", key, pcmcToUpdate.Generation)
+	c.logger.Info("Successfully updated status for PCMC", "key", key, "observedGeneration", pcmcToUpdate.Generation)
 	return nil
 }
 
@@ -359,7 +386,7 @@ func (c *Controller) generateConfigMapName(pod *v1.Pod, pcmc *v1alpha1.PodConfig
 }
 
 func (c *Controller) handleDeletedPod(ctx context.Context, podNamespace, podName string) error {
-	log.Printf("Handling deletion of Pod %s/%s", podNamespace, podName)
+	c.logger.Info("Handling deletion of Pod", "namespace", podNamespace, "name", podName)
 	unstructuredPcmcs, err := c.pcmcInformer.GetIndexer().ByIndex(cache.NamespaceIndex, podNamespace)
 	if err != nil {
 		return fmt.Errorf("failed to list PCMCs in namespace %s for deleted pod %s by indexer: %w", podNamespace, podName, err)
@@ -369,22 +396,22 @@ func (c *Controller) handleDeletedPod(ctx context.Context, podNamespace, podName
 	for _, unstructuredObj := range unstructuredPcmcs {
 		unstPcmc, ok := unstructuredObj.(*unstructured.Unstructured)
 		if !ok {
-			log.Printf("Expected Unstructured from PCMC informer but got %T for deleted pod handling", unstructuredObj)
+			c.logger.Warning("Expected Unstructured from PCMC informer but got different type for deleted pod handling", "type", fmt.Sprintf("%T", unstructuredObj))
 			continue
 		}
 		typedPcmc := &v1alpha1.PodConfigMapConfig{}
 		if errConv := runtime.DefaultUnstructuredConverter.FromUnstructured(unstPcmc.Object, typedPcmc); errConv != nil {
-			log.Printf("Failed to convert Unstructured to PCMC for deleted pod handling (obj: %s/%s): %v", unstPcmc.GetNamespace(), unstPcmc.GetName(), errConv)
+			c.logger.Error(errConv, "Failed to convert Unstructured to PCMC for deleted pod handling", "namespace", unstPcmc.GetNamespace(), "name", unstPcmc.GetName())
 			if lastErr == nil {
 				lastErr = fmt.Errorf("failed to convert PCMC %s/%s for deleted pod: %w", unstPcmc.GetNamespace(), unstPcmc.GetName(), errConv)
 			}
 			continue
 		}
 		cmName := c.generateConfigMapName(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName}}, typedPcmc)
-		log.Printf("Deleting ConfigMap %s for deleted Pod %s/%s (due to PCMC %s)", cmName, podNamespace, podName, typedPcmc.Name)
+		c.logger.Info("Deleting ConfigMap for deleted Pod", "configMapName", cmName, "podNamespace", podNamespace, "podName", podName, "pcmcName", typedPcmc.Name)
 		errDel := c.deleteConfigMapIfExists(ctx, podNamespace, cmName)
 		if errDel != nil {
-			log.Printf("Error deleting ConfigMap %s for deleted Pod %s/%s (PCMC %s): %v", cmName, podNamespace, podName, typedPcmc.Name, errDel)
+			c.logger.Error(errDel, "Error deleting ConfigMap for deleted Pod", "configMapName", cmName, "podNamespace", podNamespace, "podName", podName, "pcmcName", typedPcmc.Name)
 			if lastErr == nil {
 				lastErr = errDel
 			}
@@ -394,7 +421,7 @@ func (c *Controller) handleDeletedPod(ctx context.Context, podNamespace, podName
 }
 
 func (c *Controller) handleDeletedPcmc(ctx context.Context, pcmcNamespace, pcmcName string) error {
-	log.Printf("Handling deletion of PCMC %s/%s", pcmcNamespace, pcmcName)
+	c.logger.Info("Handling deletion of PCMC", "namespace", pcmcNamespace, "name", pcmcName)
 	pods, err := c.podLister.Pods(pcmcNamespace).List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list pods in namespace %s for deleted PCMC %s: %w", pcmcNamespace, pcmcName, err)
@@ -405,10 +432,10 @@ func (c *Controller) handleDeletedPcmc(ctx context.Context, pcmcNamespace, pcmcN
 			continue
 		}
 		cmName := c.generateConfigMapName(pod, &v1alpha1.PodConfigMapConfig{ObjectMeta: metav1.ObjectMeta{Name: pcmcName, Namespace: pcmcNamespace}})
-		log.Printf("Deleting ConfigMap %s for Pod %s/%s (due to deleted PCMC %s)", cmName, pod.Namespace, pod.Name, pcmcName)
+		c.logger.Info("Deleting ConfigMap for Pod due to deleted PCMC", "configMapName", cmName, "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", pcmcName)
 		errDel := c.deleteConfigMapIfExists(ctx, pod.Namespace, cmName)
 		if errDel != nil {
-			log.Printf("Error deleting ConfigMap %s for Pod %s/%s (deleted PCMC %s): %v", cmName, pod.Namespace, pod.Name, pcmcName, errDel)
+			c.logger.Error(errDel, "Error deleting ConfigMap for Pod (deleted PCMC)", "configMapName", cmName, "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", pcmcName)
 			if lastErr == nil {
 				lastErr = errDel
 			}
@@ -419,11 +446,13 @@ func (c *Controller) handleDeletedPcmc(ctx context.Context, pcmcNamespace, pcmcN
 
 func (c *Controller) deleteConfigMapIfExists(ctx context.Context, namespace, name string) error {
 	err := c.kubeClient.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to delete ConfigMap %s/%s: %w", namespace, name, err)
+	if err != nil && !api_errors.IsNotFound(err) {
+		metrics.RecordConfigMapOperation("delete", namespace, "error")
+		return errors.NewAPIError("delete-configmap", fmt.Sprintf("configmap/%s/%s", namespace, name), "failed to delete ConfigMap", err)
 	}
 	if err == nil {
-		log.Printf("ConfigMap %s/%s deleted successfully", namespace, name)
+		c.logger.Info("ConfigMap deleted successfully", "namespace", namespace, "name", name)
+		metrics.RecordConfigMapOperation("delete", namespace, "success")
 	}
 	return nil
 }
@@ -431,14 +460,19 @@ func (c *Controller) deleteConfigMapIfExists(ctx context.Context, namespace, nam
 func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc *v1alpha1.PodConfigMapConfig) error {
 	configMapName := c.generateConfigMapName(pod, pcmc)
 
+	// Validate generated ConfigMap name
+	if err := validation.ValidateConfigMapName(configMapName); err != nil {
+		return errors.NewValidationError("generate-configmap-name", fmt.Sprintf("configmap/%s", configMapName), "invalid ConfigMap name", err)
+	}
+
 	if pcmc.Spec.PodSelector != nil {
 		selector, err := metav1.LabelSelectorAsSelector(pcmc.Spec.PodSelector)
 		if err != nil {
-			log.Printf("Invalid podSelector in PCMC %s/%s: %v. Skipping pod %s/%s.", pcmc.Namespace, pcmc.Name, err, pod.Namespace, pod.Name)
-			return fmt.Errorf("invalid podSelector in PCMC %s/%s: %w", pcmc.Namespace, pcmc.Name, err)
+			c.logger.Warning("Invalid podSelector in PCMC, skipping pod", "pcmcNamespace", pcmc.Namespace, "pcmcName", pcmc.Name, "podNamespace", pod.Namespace, "podName", pod.Name, "error", err)
+			return errors.NewValidationError("parse-pod-selector", fmt.Sprintf("pcmc/%s/%s", pcmc.Namespace, pcmc.Name), "invalid podSelector", err)
 		}
 		if !selector.Matches(labels.Set(pod.Labels)) {
-			log.Printf("Pod %s/%s does not match selector of PCMC %s/%s. Ensuring ConfigMap %s is deleted.", pod.Namespace, pod.Name, pcmc.Namespace, pcmc.Name, configMapName)
+			c.logger.Debug("Pod does not match selector, ensuring ConfigMap is deleted", "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcNamespace", pcmc.Namespace, "pcmcName", pcmc.Name, "configMapName", configMapName)
 			return c.deleteConfigMapIfExists(ctx, pod.Namespace, configMapName)
 		}
 	}
@@ -462,6 +496,11 @@ func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc 
 		}
 	}
 
+	// Validate ConfigMap data
+	if err := validation.ValidateConfigMapData(configData); err != nil {
+		return errors.NewValidationError("validate-configmap-data", fmt.Sprintf("configmap/%s", configMapName), "invalid ConfigMap data", err)
+	}
+
 	ownerRef := metav1.NewControllerRef(pod, v1.SchemeGroupVersion.WithKind("Pod"))
 
 	cmLabels := map[string]string{
@@ -471,7 +510,7 @@ func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc 
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		existingCM, err := c.kubeClient.CoreV1().ConfigMaps(pod.Namespace).Get(ctx, configMapName, metav1.GetOptions{})
-		if errors.IsNotFound(err) {
+		if api_errors.IsNotFound(err) {
 			cm := &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            configMapName,
@@ -483,7 +522,10 @@ func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc 
 			}
 			_, createErr := c.kubeClient.CoreV1().ConfigMaps(pod.Namespace).Create(ctx, cm, metav1.CreateOptions{})
 			if createErr == nil {
-				log.Printf("ConfigMap %s/%s created for Pod %s/%s (via PCMC %s)", pod.Namespace, configMapName, pod.Namespace, pod.Name, pcmc.Name)
+				c.logger.Info("ConfigMap created for Pod", "configMapNamespace", pod.Namespace, "configMapName", configMapName, "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", pcmc.Name)
+				metrics.RecordConfigMapOperation("create", pod.Namespace, "success")
+			} else {
+				metrics.RecordConfigMapOperation("create", pod.Namespace, "error")
 			}
 			return createErr
 		}
@@ -511,13 +553,16 @@ func (c *Controller) syncConfigMapForPod(ctx context.Context, pod *v1.Pod, pcmc 
 		}
 
 		if !needsUpdate {
-			log.Printf("ConfigMap %s/%s for Pod %s/%s (via PCMC %s) is already up-to-date.", pod.Namespace, configMapName, pod.Namespace, pod.Name, pcmc.Name)
+			c.logger.Debug("ConfigMap is already up-to-date", "configMapNamespace", pod.Namespace, "configMapName", configMapName, "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", pcmc.Name)
 			return nil
 		}
 
 		_, updateErr := c.kubeClient.CoreV1().ConfigMaps(pod.Namespace).Update(ctx, existingCM, metav1.UpdateOptions{})
 		if updateErr == nil {
-			log.Printf("ConfigMap %s/%s updated for Pod %s/%s (via PCMC %s)", pod.Namespace, configMapName, pod.Namespace, pod.Name, pcmc.Name)
+			c.logger.Info("ConfigMap updated for Pod", "configMapNamespace", pod.Namespace, "configMapName", configMapName, "podNamespace", pod.Namespace, "podName", pod.Name, "pcmcName", pcmc.Name)
+			metrics.RecordConfigMapOperation("update", pod.Namespace, "success")
+		} else {
+			metrics.RecordConfigMapOperation("update", pod.Namespace, "error")
 		}
 		return updateErr
 	})

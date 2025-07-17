@@ -22,6 +22,7 @@ coverage.txt
 
 # Go Module cache
 # vendor/
+CLAUDE.md
 
 # Environment configuration files
 .envrc
