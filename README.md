@@ -12,6 +12,12 @@ This controller helps in scenarios where you need Pod-specific information to be
 *   **Metadata Inclusion**: Allows specifying which Pod labels and annotations should be included in the ConfigMap data.
 *   **Status Reporting**: The `PodConfigMapConfig` resource reports its `observedGeneration` in its status, indicating if the controller has processed the latest specification.
 *   **Namespace-Scoped**: Operates within specific namespaces, allowing for different configurations across a cluster.
+*   **Structured Logging**: Comprehensive logging with klog/v2 using structured key-value pairs, configurable log levels, and JSON output support.
+*   **Prometheus Metrics**: Built-in observability with metrics for ConfigMap operations, reconciliation duration, errors, queue depth, and PCMC status.
+*   **Input Validation**: Comprehensive validation for CRD fields, ConfigMap names/data, Pod metadata, and label/annotation keys.
+*   **Error Handling**: Typed errors with context, error aggregation, proper propagation, and retry logic with exponential backoff.
+*   **Configuration Management**: Extensive configuration via environment variables for leader election, controller settings, logging, and metrics.
+*   **Leader Election**: Multi-replica deployment support with configurable leader election using Lease locks.
 
 ## Custom Resource Definition (CRD): `PodConfigMapConfig`
 
@@ -75,6 +81,51 @@ The controller operates by watching three primary types of resources:
 *   **ConfigMap Naming**: ConfigMaps are named `pod-<pod-name>-from-<pcmc-name>-cfg`, linking them to both the Pod and the specific `PodConfigMapConfig` instance that triggered their creation.
 *   **Owner References**: Generated ConfigMaps have an OwnerReference pointing to the Pod they represent. This ensures that when a Pod is deleted, its associated ConfigMaps are automatically garbage-collected by Kubernetes.
 *   **Labels**: Generated ConfigMaps are labeled with `podconfig.example.com/generated-by-pcmc: <pcmc-name>` and `podconfig.example.com/pod-uid: <pod-uid>` for easier identification and potential cleanup.
+
+## Configuration
+
+The controller supports extensive configuration via environment variables:
+
+### Leader Election
+- `LEADER_ELECTION_ENABLED` - Enable/disable leader election (default: true)
+- `LEADER_ELECTION_LEASE_DURATION` - Lease duration (default: 15s)
+- `LEADER_ELECTION_RENEW_DEADLINE` - Renew deadline (default: 10s)
+- `LEADER_ELECTION_RETRY_PERIOD` - Retry period (default: 2s)
+- `LEADER_ELECTION_LOCK_NAME` - Lock name (default: podconfigmap-controller-lock)
+- `LEADER_ELECTION_LOCK_NAMESPACE` - Lock namespace (default: default)
+
+### Controller Settings
+- `CONTROLLER_RESYNC_PERIOD` - Informer resync period (default: 10m)
+- `CONTROLLER_POD_WORKERS` - Number of pod workers (default: 1)
+- `CONTROLLER_PCMC_WORKERS` - Number of PCMC workers (default: 1)
+- `CONTROLLER_MAX_RETRIES` - Maximum retry attempts (default: 5)
+- `CONTROLLER_RECONCILIATION_TIMEOUT` - Reconciliation timeout (default: 30s)
+
+### Logging
+- `LOG_LEVEL` - Log level (default: info)
+- `LOG_FORMAT` - Log format (default: text)
+- `LOG_JSON_FORMAT` - Enable JSON logging (default: false)
+- `DEBUG` - Enable debug logging (default: false)
+
+### Metrics
+- `METRICS_ADDR` - Metrics server address (default: :8080)
+
+## Observability
+
+### Metrics
+The controller exposes Prometheus metrics at `/metrics`:
+- `podconfigmap_controller_configmap_operations_total` - ConfigMap operations counter
+- `podconfigmap_controller_reconciliation_duration_seconds` - Reconciliation duration histogram
+- `podconfigmap_controller_reconciliation_errors_total` - Reconciliation errors counter
+- `podconfigmap_controller_queue_depth` - Work queue depth gauge
+- `podconfigmap_controller_pcmc_status` - PCMC status gauge
+- `podconfigmap_controller_active_configmaps` - Active ConfigMaps count gauge
+
+### Structured Logging
+- Uses klog/v2 with structured key-value pairs
+- Supports different log levels (info, warning, error, debug)
+- Configurable output format (text/JSON)
+- Contextual logging with operation details
 
 ## Getting Started
 
@@ -150,16 +201,38 @@ The controller operates by watching three primary types of resources:
     ```
     Check that `status.observedGeneration` matches `metadata.generation`.
 
+## Package Structure
+
+The controller is organized into several packages for better maintainability:
+
+- **`api/v1alpha1/`** - API types and CRD definitions
+- **`controller/`** - Main controller logic and reconciliation
+- **`pkg/logging/`** - Structured logging with klog/v2
+- **`pkg/metrics/`** - Prometheus metrics for observability
+- **`pkg/validation/`** - Input validation for CRDs and ConfigMaps
+- **`pkg/errors/`** - Structured error handling with context
+- **`pkg/config/`** - Configuration management with environment variables
+- **`main.go`** - Entry point with leader election and graceful shutdown
+
 ## Development
 
 ### Building the Controller
 
-This project uses Go modules.
+This project uses Go modules and includes comprehensive testing:
 ```bash
 # Build the controller binary
 make build 
 # or
 # go build -o bin/controller main.go
+
+# Run tests with coverage
+make test
+
+# Format code
+make fmt
+
+# Run go vet
+make vet
 
 # Build the Docker image (see Makefile or Dockerfile for details)
 make docker-build IMG=<your-registry>/podconfigmap-controller:latest
@@ -172,9 +245,11 @@ make docker-push IMG=<your-registry>/podconfigmap-controller:latest
 If you modify the API types in `api/v1alpha1/types.go`, you might need to regenerate CRD manifests and potentially client code (if using generated clients/listers, though this controller currently uses dynamic clients and generic informers for PCMCs).
 
 ```bash
-# (If using controller-gen)
-# make manifests
-# make generate
+# Generate deepcopy methods for API types
+make generate
+
+# Generate CRD manifests from API types
+make manifests
 ```
 
 ## Design Principles & Best Practices
