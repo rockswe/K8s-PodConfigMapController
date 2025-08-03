@@ -370,7 +370,7 @@ make manifests
 
 ## Design Principles & Best Practices
 
-Developing robust Kubernetes controllers requires careful consideration of API design and controller mechanics. This project aims to follow best practices, drawing inspiration from idiomatic Kubernetes controller development as discussed by community leaders like Ahmet Alp Balkan.
+Developing robust Kubernetes controllers requires careful consideration of API design and controller mechanics. This project aims to follow best practices with drawing inspiration from idiomatic Kubernetes controller development.
 
 ### CRD Design Philosophy
 
