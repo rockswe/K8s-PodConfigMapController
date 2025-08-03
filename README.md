@@ -392,7 +392,7 @@ Developing robust Kubernetes controllers requires careful consideration of API d
 
 ### Status Reporting: `observedGeneration`
 
-*   As highlighted by Ahmet Alp Balkan, simply having a `Ready` condition is often not enough. The `observedGeneration` field in the `status` of `PodConfigMapConfig` is important. It tells consumers whether the current status (and by extension, the ConfigMaps managed by this CRD instance) reflects the *latest* version of the `PodConfigMapConfig`'s `spec`. If `cond.observedGeneration != metadata.generation`, the status information might be stale because the controller hasn't yet reconciled the most recent update to the CRD.
+*   Simply having a `Ready` condition is often not enough. The `observedGeneration` field in the `status` of `PodConfigMapConfig` is important. It tells consumers whether the current status (and by extension, the ConfigMaps managed by this CRD instance) reflects the *latest* version of the `PodConfigMapConfig`'s `spec`. If `cond.observedGeneration != metadata.generation`, the status information might be stale because the controller hasn't yet reconciled the most recent update to the CRD.
 
 ### Understanding Cached Clients
 
