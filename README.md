@@ -4,6 +4,25 @@ PodConfigMapController is a k8s controller that dynamically generates and manage
 
 This controller helps in scenarios where you need Pod-specific information to be available as a ConfigMap, for example, to be consumed by other applications, monitoring systems, or for easier debugging and visibility into Pod metadata.
 
+<table>
+  <tr>
+    <th>metrics</th>
+    <th>config</th>
+  </tr>
+  <tr>
+    <td><img src="img/metrics.png" width="100%"/></td>
+    <td><img src="img/config.png" width="100%"/></td>
+  </tr>
+  <tr>
+    <th>ebpf</th>
+    <th>version</th>
+  </tr>
+  <tr>
+    <td><img src="img/ebpf.png" width="100%"/></td>
+    <td><img src="img/version.png" width="100%"/></td>
+  </tr>
+</table>
+
 ## Features
 
 *   **Dynamic ConfigMap Generation**: Automatically creates, updates, and deletes ConfigMaps based on Pod lifecycle and `PodConfigMapConfig` resources.
