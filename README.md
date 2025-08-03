@@ -6,16 +6,16 @@ This controller helps in scenarios where you need Pod-specific information to be
 
 <table>
   <tr>
-    <th>metrics</th>
-    <th>config</th>
+    <th>Metrics</th>
+    <th>Config</th>
   </tr>
   <tr>
     <td><img src="img/metrics.png" width="100%"/></td>
     <td><img src="img/config.png" width="100%"/></td>
   </tr>
   <tr>
-    <th>ebpf</th>
-    <th>version</th>
+    <th>eBPF</th>
+    <th>Version</th>
   </tr>
   <tr>
     <td><img src="img/ebpf.png" width="100%"/></td>
